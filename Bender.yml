@@ -16,6 +16,7 @@ sources:
       # Level 0
       - rtl/hwpe_ctrl_interfaces.sv
       - rtl/hwpe_ctrl_package.sv
+      - rtl/synchronous_fifo.sv
       # Level 1
       - rtl/hwpe_ctrl_regfile_ff.sv
       - rtl/hwpe_ctrl_regfile_latch.sv

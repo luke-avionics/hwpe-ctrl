@@ -19,7 +19,9 @@ module hwpe_ctrl_slave
 #(
   parameter int unsigned REGFILE_SCM    = 1,
   parameter int unsigned N_CORES        = 4,
-  parameter int unsigned N_CONTEXT      = 2,
+  //TODO: more like a instant switch of compute node with different configuration (stored in different contexts of the regfiles)?  Switched with our customized config func: hwme_increment_context(); 
+  //But it's a little buggy; as the context is tied to the running states of the cores ... 
+  parameter int unsigned N_CONTEXT      = 2, 
   parameter int unsigned N_EVT          = REGFILE_N_EVT,
   parameter int unsigned N_IO_REGS      = 2,
   parameter int unsigned N_GENERIC_REGS = 0,
@@ -37,7 +39,11 @@ module hwpe_ctrl_slave
 
   input  ctrl_slave_t         ctrl_i,
   output flags_slave_t        flags_o,
-  output ctrl_regfile_t       reg_file
+  output ctrl_regfile_t       reg_file,
+  
+  // status monitoring from hwme
+  input logic                static_context_mode, //whether to manually switch the context and stick with it, i.e., running context is constant, or the running context is automatically switched by the hwme
+  input regfile_in_t         regfile_in_from_hwme
 );
 
   localparam int unsigned N_REGISTERS         = REGFILE_N_REGISTERS;
@@ -90,7 +96,7 @@ module hwpe_ctrl_slave
     else if(regfile_flags.is_trigger) begin
       triggered_q <= '1;
     end
-    else if(running_context == pointer_context && regfile_flags.full_context == '0 && regfile_flags.true_done == 1) begin
+    else if((running_context == pointer_context || static_context_mode) && regfile_flags.full_context == '0 && regfile_flags.true_done == 1) begin
       triggered_q <= '0;
     end
   end
@@ -139,8 +145,10 @@ module hwpe_ctrl_slave
         else if(clear_o == 1'b1)
           running_context <= 0;
         else begin
-          if (regfile_flags.true_done == 1)
+          if (regfile_flags.true_done == 1 && ~static_context_mode)
             running_context <= running_context + 1;
+          else if (static_context_mode)
+            running_context <= pointer_context;
         end
       end
       // Pending contexts
@@ -151,10 +159,13 @@ module hwpe_ctrl_slave
         else if(clear_o == 1'b1)
           counter_pending <= 0;
         else begin
-          if ((regfile_flags.is_commit == 1) && (regfile_flags.true_done == 0))
+          if ((regfile_flags.is_commit == 1) && (regfile_flags.true_done == 0) && ~static_context_mode)
             counter_pending <= counter_pending + 1;
-          else if ((regfile_flags.is_commit == 0) && (regfile_flags.true_done == 1))
+          else if ((regfile_flags.is_commit == 0) && (regfile_flags.true_done == 1) && ~static_context_mode)
             counter_pending <= counter_pending - 1;
+          else
+            //else only one context is used
+            counter_pending <= 0;
         end
       end
 
@@ -192,12 +203,15 @@ module hwpe_ctrl_slave
   // Flags
   always_comb
   begin : flags_proc
-    regfile_flags.is_mandatory  = (cfg.add[LOG_REGS+2-1:2] <= N_MANDATORY_REGS+N_RESERVED_REGS-1)                     ? 1 : 0;  // Accessed reg is mandatory (or reserved)
-    regfile_flags.is_contexted  = (cfg.add[LOG_REGS+2-1:2] > N_MANDATORY_REGS+N_RESERVED_REGS+N_MAX_GENERIC_REGS-1)   ? 1 : 0;  // Accessed reg is contexted
+    //TODO: maybe add additional condition that cfg.add is not 0 or (cfg.req &  cfg.wen | cfg.req & ~cfg.wen) to avoid the unnecessary flags generation
+    regfile_flags.is_mandatory  = (cfg.add[LOG_REGS+2-1:2] <= N_MANDATORY_REGS+N_RESERVED_REGS-1 & ((cfg.req & cfg.wen) | (cfg.req & ~cfg.wen)) ) ? 1 : 0;  // Accessed reg is mandatory (or reserved)
+    //In the free running (ie non-static context mode), use the explicit address to determine the status
+    regfile_flags.is_contexted  = (cfg.add[LOG_REGS_MC+2:LOG_REGS+2] != '0 || (pointer_context > 0 && static_context_mode) ) ? 1 : 0;  // Accessed reg is contexted
+    // regfile_flags.is_contexted  = (cfg.add[LOG_REGS+2-1:2] > N_MANDATORY_REGS+N_RESERVED_REGS+N_MAX_GENERIC_REGS-1 || (pointer_context > 0 && static_context_mode) ) ? 1 : 0;  // Accessed reg is contexted
     regfile_flags.is_read       = (cfg.req == 1'b1 && cfg.wen == 1'b1);
     regfile_flags.is_testset    = (cfg.req == 1'b1 && cfg.wen == 1'b1 && cfg.add[LOG_REGS+2-1:2] == REGFILE_MANDATORY_ACQUIRE) ? 1 : 0;  // Operation is a test&set to register context_ts
     regfile_flags.is_trigger    = (cfg.req == 1'b1 && cfg.wen == 1'b0 && cfg.add[LOG_REGS+2-1:2] == REGFILE_MANDATORY_TRIGGER && cfg.data == '0) ? 1 : 0;  // Operation is a trigger
-    regfile_flags.is_commit     = (cfg.req == 1'b1 && cfg.wen == 1'b0 && cfg.add[LOG_REGS+2-1:2] == REGFILE_MANDATORY_TRIGGER) ? 1 : 0;  // Operation is a commit (or commit & trigger)
+    regfile_flags.is_commit     = (cfg.req == 1'b1 && cfg.wen == 1'b0 && cfg.add[LOG_REGS+2-1:2] == REGFILE_MANDATORY_TRIGGER && cfg.data == '1) ? 1 : 0;  // Operation is a commit (or commit & trigger)
     regfile_flags.true_done     = ctrl_i.done & flags_o.is_working;                                                             // This is necessary because sometimes done is asserted as soon as rst_ni becomes 1
     flags_o.enable              = s_enable_after[3];                                                                            // Enable after three cycles from rst_ni
   end
@@ -237,6 +251,75 @@ module hwpe_ctrl_slave
     regfile_in.be    = cfg.be;
   end
 
+  wire [31:0] regfile_in_from_hwme_data;
+  wire regfile_in_from_hwme_data_fifo_empty;
+  wire regfile_in_from_hwme_data_fifo_full;
+  wire [31:0] regfile_in_from_hwme_addr;
+  wire regfile_in_from_hwme_addr_fifo_empty;
+  wire regfile_in_from_hwme_addr_fifo_full;
+
+  // reg buffers; assume never full 
+  synchronous_fifo #(
+    .DEPTH      (4),
+    .DATA_WIDTH (32)
+  ) reg_from_hwme_data_fifo (
+    .clk    (clk_i),
+    .rst_n  (rst_ni),
+    .w_en   (regfile_in_from_hwme.wren),
+    .r_en   (~regfile_in.rden & ~regfile_in.wren), // only happens when cpu is not reading or writing
+    .data_in(regfile_in_from_hwme.wdata),
+    .data_out(regfile_in_from_hwme_data),
+    .full   (regfile_in_from_hwme_data_fifo_full),
+    .empty  (regfile_in_from_hwme_data_fifo_empty)
+  );
+
+  synchronous_fifo #(
+    .DEPTH      (4),
+    .DATA_WIDTH (32)
+  ) reg_from_hwme_addr_fifo (
+    .clk    (clk_i),
+    .rst_n  (rst_ni),
+    .w_en   (regfile_in_from_hwme.wren),
+    .r_en   (~regfile_in.rden & ~regfile_in.wren), // only happens when cpu is not reading or writing
+    .data_in(regfile_in_from_hwme.addr),
+    .data_out(regfile_in_from_hwme_addr),
+    .full   (regfile_in_from_hwme_addr_fifo_full),
+    .empty  (regfile_in_from_hwme_addr_fifo_empty)
+  );
+
+  reg regfile_in_from_hwme_rden_reg;
+  reg regfile_in_from_hwme_wren_reg;
+
+  //sync en signals for the data/addr value from fifo
+  always_ff @(posedge clk_i or negedge rst_ni)
+  begin
+    if (~regfile_in_from_hwme_data_fifo_empty & ~regfile_in_from_hwme_addr_fifo_empty) begin
+      regfile_in_from_hwme_rden_reg <= 1'b0;
+      regfile_in_from_hwme_wren_reg <= 1'b1;
+    end else begin
+      regfile_in_from_hwme_rden_reg <= 1'b0;
+      regfile_in_from_hwme_wren_reg <= 1'b0;
+    end
+  end
+
+  regfile_in_t regfile_in_muxed;
+  always_comb
+  begin: regfile_in_mux
+    //need to cover the mandatory case
+    if ((cfg.req &  cfg.wen) | (cfg.req & ~cfg.wen)) begin
+      regfile_in_muxed = regfile_in;
+    end else begin
+      regfile_in_muxed.rden  = regfile_in_from_hwme_rden_reg;
+      regfile_in_muxed.wren  = regfile_in_from_hwme_wren_reg;
+      regfile_in_muxed.wdata = regfile_in_from_hwme_data;
+      //running context is only suitable for giving the status during running not during/after the completion
+      regfile_in_muxed.addr  = {pointer_context, regfile_in_from_hwme_addr[LOG_REGS-1:0]};
+    end
+  end
+
+
+
+
   assign regfile_flags.pointer_context = pointer_context;
   assign regfile_flags.running_context = running_context;
 
@@ -250,7 +333,7 @@ module hwpe_ctrl_slave
     .clk_i         ( clk_i         ),
     .rst_ni        ( rst_ni        ),
     .clear_i       ( clear_regfile ),
-    .regfile_in_i  ( regfile_in    ),
+    .regfile_in_i  ( regfile_in_muxed),
     .regfile_out_o ( regfile_out   ),
     .flags_i       ( regfile_flags ),
     .reg_file      ( reg_file      )
@@ -310,7 +393,7 @@ module hwpe_ctrl_slave
     else begin
       case (running_state)
         RUN_IDLE : begin
-          if (running_context == pointer_context && regfile_flags.full_context == 0) begin
+          if (running_context == pointer_context && regfile_flags.full_context == 0 && ~static_context_mode) begin
             running_state <= RUN_IDLE;
             flags_o.start      <= 0;
             flags_o.is_working    <= 0;
